@@ -1,3 +1,7 @@
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+
 /**
  * CASIO BASIC Tokenizer for Android
  * Converts ASCII CASIO BASIC source into compact token stream
@@ -5,7 +9,6 @@
  * Philosophy: Authentic CASIO calculators tokenize everything into 1-byte tokens.
  * This enables maximum performance and compact program storage.
  */
-
 public class CasioTokenizer {
 
     // --- Token Types (matching CASIO's internal representation) ---
@@ -52,49 +55,65 @@ public class CasioTokenizer {
     public static final int TOK_COMPLEX = 39;
     public static final int TOK_BASEN = 40;
 
-    // --- Keyword Mapping ---
-    // Maps ASCII strings to token types
-    // Sorted by length (longest first) to ensure correct matching
+    // --- FA-6 Cassette Interface & Memory Management Tokens ---
+    public static final int TOK_SAVE = 41;
+    public static final int TOK_LOAD = 42;
+    public static final int TOK_VERIFY = 43;
+    public static final int TOK_ALL = 44;
+    public static final int TOK_NEW = 45;
 
+    // --- Detailed Token Representation ---
+    public static class Token {
+        public final int type;
+        public final String text;
+        public final int line;
+        public final int column;
+
+        public Token(int type, String text, int line, int column) {
+            this.type = type;
+            this.text = text != null ? text : "";
+            this.line = line;
+            this.column = column;
+        }
+
+        @Override
+        public String toString() {
+            return tokenToString(type) + (!text.isEmpty() ? "('" + text + "')" : "");
+        }
+    }
+
+    // --- Keyword Mapping ---
     private static final String[] KEYWORDS = {
         "SIN", "COS", "TAN", "ASN", "ACS", "ATN",  // trig
         "SINH", "COSH", "TANH",                       // hyperbolic
         "SQR", "ABS", "SGN", "LOG", "LN", "EXP", "RND",  // functions
         "PRINT", "INPUT", "FOR", "NEXT", "GOTO", "GOSUB", "RETURN",  // control
         "IF", "THEN", "TO", "STEP", "DIM", "CLEAR", "MODE",  // statements
-        "COMPLEX", "BASEN", "RUN", "STOP"              // special
+        "COMPLEX", "BASEN", "RUN", "STOP",             // special
+        "SAVE", "LOAD", "VERIFY", "ALL", "NEW"         // FA-6 / Memory
     };
 
-    // Token type for each keyword (index-matched to KEYWORDS above)
-    // These MUST match the TOK_* constants above
     private static final int[] TOK_TYPES = {
-        TOK_SIN, TOK_COS, TOK_TAN, TOK_SIN, TOK_COS, TOK_TAN,  // ASN, ACS, ATN ignored or mapped
-        TOK_SIN, TOK_COS, TOK_TAN,  // SINH, COSH, TANH - could map to SIN/COS/TAN with flag
-        TOK_SQR, TOK_ABS, TOK_SGN, TOK_LOG, TOK_LN, TOK_EXP, TOK_RND,  // SQR, ABS, SGN, LOG, LN, EXP, RND
+        TOK_SIN, TOK_COS, TOK_TAN, TOK_SIN, TOK_COS, TOK_TAN,
+        TOK_SIN, TOK_COS, TOK_TAN,
+        TOK_SQR, TOK_ABS, TOK_SGN, TOK_LOG, TOK_LN, TOK_EXP, TOK_RND,
         TOK_PRINT, TOK_INPUT, TOK_FOR, TOK_NEXT, TOK_GOTO, TOK_GOSUB, TOK_RETURN,
-        TOK_IF, TOK_THEN, TOK_TO, TOK_STEP, TOK_DIM, TOK_CLEAR, TOK_MODE, TOK_COMPLEX, TOK_BASEN,
-        TOK_EOF, TOK_EOF  // RUN, STOP - handled elsewhere
+        TOK_IF, TOK_THEN, TOK_TO, TOK_STEP, TOK_DIM, TOK_CLEAR, TOK_MODE,
+        TOK_COMPLEX, TOK_BASEN, TOK_EOF, TOK_EOF,
+        TOK_SAVE, TOK_LOAD, TOK_VERIFY, TOK_ALL, TOK_NEW
     };
 
-    // Keyword -> token type lookup
-    private static final java.util.HashMap<String, Integer> keywordMap;
+    private static final HashMap<String, Integer> keywordMap;
 
     static {
-        keywordMap = new java.util.HashMap<>();
+        keywordMap = new HashMap<>();
         for (int i = 0; i < KEYWORDS.length; i++) {
             keywordMap.put(KEYWORDS[i], TOK_TYPES[i]);
-        }
-        // Also map lowercase
-        for (String kw : KEYWORDS) {
-            keywordMap.put(kw.toLowerCase(), TOK_TYPES[i]); // simplified
+            keywordMap.put(KEYWORDS[i].toLowerCase(), TOK_TYPES[i]);
         }
     }
 
-    // --- Arrow storage mapping ---
-    // CASIO uses → (right arrow, U+2192) for variable storage
-    // A → B stores into B, distinct from A = B
-
-    private static final char ARROW_CHAR = '→'; // right arrow
+    private static final char ARROW_CHAR = '→';
 
     // --- Tokenizer State ---
     private String source;
@@ -109,31 +128,40 @@ public class CasioTokenizer {
     }
 
     /**
-     * Tokenize a CASIO BASIC source string
-     * @param source The BASIC source code
-     * @return Array of token types
+     * Tokenize a CASIO BASIC source string into integer token types
      */
     public int[] tokenize(String source) {
-        this.source = source;
+        List<Token> detailed = tokenizeDetailed(source);
+        int[] result = new int[detailed.size()];
+        for (int i = 0; i < detailed.size(); i++) {
+            result[i] = detailed.get(i).type;
+        }
+        return result;
+    }
+
+    /**
+     * Tokenize a CASIO BASIC source string into detailed Tokens with text values
+     */
+    public List<Token> tokenizeDetailed(String source) {
+        this.source = source != null ? source : "";
         this.pos = 0;
         this.line = 1;
         this.column = 1;
 
-        java.util.ArrayList<Integer> tokens = new java.util.ArrayList<>();
+        List<Token> tokens = new ArrayList<>();
 
-        while (pos < source.length()) {
-            char ch = source.charAt(pos);
+        while (pos < this.source.length()) {
+            char ch = this.source.charAt(pos);
 
             // Handle newline
             if (ch == '\n') {
-                tokens.add(null); // placeholder for line tracking, or TOK_EOF handling
                 line++;
                 column = 1;
                 pos++;
                 continue;
             }
 
-            // Handle whitespace (skip but track column)
+            // Handle whitespace
             if (ch == ' ' || ch == '\t') {
                 column++;
                 pos++;
@@ -141,65 +169,58 @@ public class CasioTokenizer {
             }
 
             // Handle right arrow (→) for storage
-            if (ch == '→') {
-                tokens.add(TOK_ARROW);
-                column += 1; // arrow is 1 char visually
+            if (ch == ARROW_CHAR || ch == '→') {
+                tokens.add(new Token(TOK_ARROW, "→", line, column));
+                column += 1;
                 pos++;
                 continue;
             }
 
             // Handle numbers
-            if (Character.isDigit(ch) || (ch == '.' && pos + 1 < source.length() && Character.isDigit(source.charAt(pos + 1)))) {
-                int[] numTok = readNumber();
-                // Add number token(s)
-                for (int v : numTok) {
-                    tokens.add(v);
-                }
+            if (Character.isDigit(ch) || (ch == '.' && pos + 1 < this.source.length() && Character.isDigit(this.source.charAt(pos + 1)))) {
+                int startCol = column;
+                String numStr = readNumberString();
+                tokens.add(new Token(TOK_NUMBER, numStr, line, startCol));
                 continue;
             }
 
             // Handle strings "text"
             if (ch == '"') {
+                int startCol = column;
                 String str = readString();
-                tokens.add(TOK_STRING);
-                // Could also store the string value separately
-                column += str.length() + 2; // include quotes
-                pos++;
+                tokens.add(new Token(TOK_STRING, str, line, startCol));
                 continue;
             }
 
             // Handle identifiers and keywords
             if (Character.isLetter(ch) || ch == '_') {
+                int startCol = column;
                 String word = readIdentifier();
                 Integer tokType = keywordMap.get(word.toUpperCase());
                 if (tokType != null) {
-                    tokens.add(tokType);
+                    tokens.add(new Token(tokType, word, line, startCol));
                 } else {
-                    // Unknown identifier - treat as variable
-                    tokens.add(TOK_IDENT);
-                    // Store name separately or handle in parser
+                    tokens.add(new Token(TOK_IDENT, word, line, startCol));
                 }
-                column += word.length();
-                pos++;
                 continue;
             }
 
             // Single-character operators
+            int startCol = column;
             switch (ch) {
-                case '+': tokens.add(TOK_PLUS); break;
-                case '-': tokens.add(TOK_MINUS); break;
-                case '*': tokens.add(TOK_STAR); break;
-                case '/': tokens.add(TOK_SLASH); break;
-                case '^': tokens.add(TOK_POWER); break;
-                case '=': tokens.add(TOK_EQUAL); break;
-                case '(': tokens.add(TOK_LPAREN); break;
-                case ')': tokens.add(TOK_RPAREN); break;
-                case ',': tokens.add(TOK_COMMA); break;
-                case '\r': // carriage return, skip
+                case '+': tokens.add(new Token(TOK_PLUS, "+", line, startCol)); break;
+                case '-': tokens.add(new Token(TOK_MINUS, "-", line, startCol)); break;
+                case '*': tokens.add(new Token(TOK_STAR, "*", line, startCol)); break;
+                case '/': tokens.add(new Token(TOK_SLASH, "/", line, startCol)); break;
+                case '^': tokens.add(new Token(TOK_POWER, "^", line, startCol)); break;
+                case '=': tokens.add(new Token(TOK_EQUAL, "=", line, startCol)); break;
+                case '(': tokens.add(new Token(TOK_LPAREN, "(", line, startCol)); break;
+                case ')': tokens.add(new Token(TOK_RPAREN, ")", line, startCol)); break;
+                case ',': tokens.add(new Token(TOK_COMMA, ",", line, startCol)); break;
+                case '\r':
                     pos++;
                     continue;
                 default:
-                    // Illegal character
                     throw new RuntimeException(
                         "Illegal character '" + ch + "' at line " + line + ", column " + column
                     );
@@ -209,19 +230,12 @@ public class CasioTokenizer {
         }
 
         // Add EOF
-        tokens.add(TOK_EOF);
-
-        // Convert to primitive array
-        int[] result = new int[tokens.size()];
-        for (int i = 0; i < result.length; i++) {
-            result[i] = tokens.get(i);
-        }
-        return result;
+        tokens.add(new Token(TOK_EOF, "", line, column));
+        return tokens;
     }
 
-    /** Read a numeric literal, return consumed values */
-    private int[] readNumber() {
-        int startCol = column;
+    /** Read a numeric literal string */
+    private String readNumberString() {
         StringBuilder num = new StringBuilder();
         boolean hasDot = false;
 
@@ -240,28 +254,7 @@ public class CasioTokenizer {
                 break;
             }
         }
-
-        // Parse as int or float
-        int[] result = new int[2]; // [tokenType, valueEncoded]
-        String numStr = num.toString();
-
-        if (numStr.contains(".")) {
-            result[0] = TOK_NUMBER; // we'll use TOK_NUMBER for both, parser distinguishes
-            try {
-                result[1] = (int) Float.parseFloat(numStr);
-            } catch (NumberFormatException e) {
-                result[1] = 0;
-            }
-        } else {
-            result[0] = TOK_NUMBER;
-            try {
-                result[1] = Integer.parseInt(numStr);
-            } catch (NumberFormatException e) {
-                result[1] = 0;
-            }
-        }
-
-        return result;
+        return num.toString();
     }
 
     /** Read a string literal "text" */
@@ -285,11 +278,9 @@ public class CasioTokenizer {
         return sb.toString();
     }
 
-    /** Read an identifier (variable name or keyword) */
+    /** Read an identifier or keyword starting at current pos */
     private String readIdentifier() {
         StringBuilder sb = new StringBuilder();
-        column++;
-        pos++;
 
         while (pos < source.length()) {
             char ch = source.charAt(pos);
@@ -307,8 +298,6 @@ public class CasioTokenizer {
 
     /**
      * Get human-readable token name
-     * @param token token type integer
-     * @return descriptive name
      */
     public static String tokenToString(int token) {
         switch (token) {
@@ -333,7 +322,7 @@ public class CasioTokenizer {
             case TOK_EXP: return "EXP";
             case TOK_RND: return "RND";
             case TOK_SGN: return "SGN";
-            case TOK_IDENT: return "IDENT (variable)";
+            case TOK_IDENT: return "IDENT";
             case TOK_NUMBER: return "NUMBER";
             case TOK_STRING: return "STRING";
             case TOK_PRINT: return "PRINT";
@@ -352,6 +341,11 @@ public class CasioTokenizer {
             case TOK_MODE: return "MODE";
             case TOK_COMPLEX: return "COMPLEX";
             case TOK_BASEN: return "BASE-N";
+            case TOK_SAVE: return "SAVE";
+            case TOK_LOAD: return "LOAD";
+            case TOK_VERIFY: return "VERIFY";
+            case TOK_ALL: return "ALL";
+            case TOK_NEW: return "NEW";
             default: return "UNKNOWN(" + token + ")";
         }
     }

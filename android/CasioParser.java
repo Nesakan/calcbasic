@@ -1,485 +1,430 @@
-/**
- * CASIO BASIC Parser for Android
- * Recursive-descent parser working with CasioTokenizer output
- *
- * Grammar (CASIO style, precedence lowest to highest):
- *   expression  := term   (('+' | '-') term)*
- *   term        := factor (('*' | '/') factor)
- *   factor      := power
- *   power       := unary ('^' power)?         right-associative
- *   unary       := '-' unary | '+' unary | primary
- *   primary     := NUMBER | IDENTIFIER | '(' expression ')'
- *   storage     := IDENTIFIER ARROW            (A → B)
- *   assignment  := IDENTIFIER EQUAL          (A = B)
- *
- * CASIO-specific behaviors:
- * - Line numbers are REQUIRED at start of each statement
- * - A → B stores into B (distinct from A = B)
- * - String variables are A-Z$ with limited functionality
- * - Functions: SIN/COS/TAN work in degree mode (can switch to radian)
- */
+import java.util.Arrays;
+import java.util.List;
 
+/**
+ * CASIO BASIC Parser & Command Executor for Android
+ *
+ * Implements recursive-descent parsing and statement evaluation for Casio BASIC,
+ * with full support for:
+ * - Program areas P0 through P9 (CasioMemoryManager)
+ * - FA-6 cassette tape interface commands: SAVE, SAVE ALL, LOAD, LOAD ALL, VERIFY (CasioTapeManager)
+ * - Direct command mode (Ready P0 prompt)
+ * - Mathematical expressions with Casio operator precedence and functions (SIN, COS, TAN, SQR, etc.)
+ * - Arrow storage (expression → variable) and assignment (=)
+ */
 public class CasioParser {
 
-    // --- Token Stream ---
-    private int[] tokens;
+    private final CasioTokenizer tokenizer;
+    private final CasioMemoryManager memoryManager;
+    private final CasioTapeManager tapeManager;
+
+    // Runtime state (variables A-Z, 0-25)
+    private final double[] variables;
+    private final String[] stringVars;
+
+    // Token execution state
+    private List<CasioTokenizer.Token> tokens;
     private int pos;
-    private int line;
-    private int column;
 
-    // --- Runtime state (like real CALCOS...) ---
-    private double[] variables;       // A-Z, M - numeric
-    private String[] stringVars;      // A-Z$ - string (limited)
-    private int[] lineNumbers;        // Program line numbers
-    private int currentLine;          // Current line being executed
-    private int currentLineNum;       // Line number in source
-    private boolean running;          // Program run state
+    // Output buffer for PRINT or status messages
+    private final StringBuilder outputBuffer;
+    private String lastStatus;
 
-    // --- Parser Construction ---
     public CasioParser() {
-        this.variables = new double[26]; // A-Z + M
-        this.stringVars = new String[26]; // A-Z$
-        this.lineNumbers = new int[256]; // max 255 lines + 1
-        this.currentLine = 0;
-        this.currentLineNum = 0;
-        this.running = false;
-        // Initialize line numbers with typical CASIO step
-        for (int i = 0; i < 256; i++) {
-            lineNumbers[i] = -1; // -1 = not used
+        this(new CasioMemoryManager(), new CasioTapeManager());
+    }
+
+    public CasioParser(CasioMemoryManager memoryManager, CasioTapeManager tapeManager) {
+        this.tokenizer = new CasioTokenizer();
+        this.memoryManager = memoryManager;
+        this.tapeManager = tapeManager;
+        this.variables = new double[26];
+        this.stringVars = new String[26];
+        this.outputBuffer = new StringBuilder();
+        this.lastStatus = memoryManager.getPrompt();
+    }
+
+    public CasioMemoryManager getMemoryManager() {
+        return memoryManager;
+    }
+
+    public CasioTapeManager getTapeManager() {
+        return tapeManager;
+    }
+
+    public String getLastStatus() {
+        return lastStatus;
+    }
+
+    public double getVariable(char name) {
+        int idx = Character.toUpperCase(name) - 'A';
+        if (idx >= 0 && idx < 26) {
+            return variables[idx];
+        }
+        return 0.0;
+    }
+
+    public void setVariable(char name, double value) {
+        int idx = Character.toUpperCase(name) - 'A';
+        if (idx >= 0 && idx < 26) {
+            variables[idx] = value;
         }
     }
 
-    /** Set the full tokenized source and line number mapping */
-    public void setSource(int[] tokens, int[] lineNums, int currentLineNum) {
-        this.tokens = tokens;
-        this.lineNumbers = lineNums;
-        this.currentLineNum = currentLineNum;
+    /**
+     * Execute a direct command entered at the Ready prompt.
+     * Examples:
+     *   SAVE "BASIC"
+     *   SAVE ALL
+     *   LOAD "BASIC"
+     *   VERIFY "BASIC"
+     *   P1
+     *   NEW
+     *   NEW ALL
+     *   PRINT 2 + 3 * 4
+     */
+    public String executeDirect(String commandLine) {
+        if (commandLine == null || commandLine.trim().isEmpty()) {
+            return memoryManager.getPrompt();
+        }
+
+        String trimmed = commandLine.trim();
+
+        // Check for slot switch command: P0, P1, ..., P9
+        if (trimmed.toUpperCase().matches("^P[0-9]$")) {
+            int slot = trimmed.charAt(1) - '0';
+            memoryManager.setActiveSlot(slot);
+            lastStatus = memoryManager.getPrompt();
+            return lastStatus;
+        }
+
+        this.tokens = tokenizer.tokenizeDetailed(trimmed);
         this.pos = 0;
-        this.line = 1;
-        this.column = 1;
-        this.running = true;
-    }
+        this.outputBuffer.setLength(0);
 
-    /** Get the next token from the stream */
-    private int advance() {
-        if (pos >= tokens.length) {
-            return CasioTokenizer.TOK_EOF;
+        try {
+            executeStatement();
+            if (outputBuffer.length() > 0) {
+                return outputBuffer.toString();
+            }
+            return lastStatus != null ? lastStatus : memoryManager.getPrompt();
+        } catch (CasioTapeManager.CasioTapeException e) {
+            lastStatus = e.getDisplayError() + "\n" + memoryManager.getPrompt();
+            return lastStatus;
+        } catch (Exception e) {
+            lastStatus = "P" + memoryManager.getActiveSlot() + " error 0\n" + memoryManager.getPrompt();
+            return lastStatus;
         }
-        int tok = tokens[pos];
-        pos++;
-        // Track line/column for error messages
-        if (source[pos-1] == '\n' || pos-1 == 0) {
-            // simple tracking - real implementation would be more robust
+    }
+
+    /**
+     * Parse and execute a single statement.
+     */
+    public void executeStatement() throws CasioTapeManager.CasioTapeException {
+        if (pos >= tokens.size() || peekType() == CasioTokenizer.TOK_EOF) {
+            return;
         }
-        return tok;
-    }
 
-    /** Peek at current token without consuming */
-    private int peek() {
-        if (pos >= tokens.length) {
-            return CasioTokenizer.TOK_EOF;
+        int tok = peekType();
+
+        // --- SAVE / SAVE ALL ---
+        if (tok == CasioTokenizer.TOK_SAVE) {
+            advance(); // consume SAVE
+            boolean isAll = false;
+            String filename = "";
+
+            if (peekType() == CasioTokenizer.TOK_ALL) {
+                advance(); // consume ALL
+                isAll = true;
+                if (peekType() == CasioTokenizer.TOK_STRING || peekType() == CasioTokenizer.TOK_IDENT) {
+                    filename = advance().text;
+                }
+            } else if (peekType() == CasioTokenizer.TOK_STRING || peekType() == CasioTokenizer.TOK_IDENT) {
+                filename = advance().text;
+                if (peekType() == CasioTokenizer.TOK_ALL) {
+                    advance();
+                    isAll = true;
+                }
+            }
+
+            int slot = memoryManager.getActiveSlot();
+            if (isAll) {
+                lastStatus = tapeManager.saveAll(filename, slot, memoryManager.getAllPrograms());
+            } else {
+                lastStatus = tapeManager.save(filename, slot, memoryManager.getActiveProgram());
+            }
+            return;
         }
-        return tokens[pos];
+
+        // --- LOAD / LOAD ALL ---
+        if (tok == CasioTokenizer.TOK_LOAD) {
+            advance(); // consume LOAD
+            boolean isAll = false;
+            String filename = "";
+
+            if (peekType() == CasioTokenizer.TOK_ALL) {
+                advance(); // consume ALL
+                isAll = true;
+                if (peekType() == CasioTokenizer.TOK_STRING || peekType() == CasioTokenizer.TOK_IDENT) {
+                    filename = advance().text;
+                }
+            } else if (peekType() == CasioTokenizer.TOK_STRING || peekType() == CasioTokenizer.TOK_IDENT) {
+                filename = advance().text;
+                if (peekType() == CasioTokenizer.TOK_ALL) {
+                    advance();
+                    isAll = true;
+                }
+            }
+
+            int slot = memoryManager.getActiveSlot();
+            if (isAll) {
+                String[] allProgs = tapeManager.loadAll(filename, slot);
+                memoryManager.setAllPrograms(allProgs);
+            } else {
+                String code = tapeManager.load(filename, slot);
+                memoryManager.setActiveProgram(code);
+            }
+            lastStatus = memoryManager.getPrompt();
+            return;
+        }
+
+        // --- VERIFY ---
+        if (tok == CasioTokenizer.TOK_VERIFY) {
+            advance(); // consume VERIFY
+            String filename = "";
+            if (peekType() == CasioTokenizer.TOK_STRING || peekType() == CasioTokenizer.TOK_IDENT) {
+                filename = advance().text;
+            }
+
+            int slot = memoryManager.getActiveSlot();
+            CasioTapeManager.VerifyResult res = tapeManager.verify(
+                filename,
+                slot,
+                memoryManager.getActiveProgram(),
+                memoryManager.getAllPrograms()
+            );
+
+            if (res.success) {
+                lastStatus = res.statusDisplay;
+            } else {
+                lastStatus = res.statusDisplay + "\n" + memoryManager.getPrompt();
+            }
+            return;
+        }
+
+        // --- NEW / NEW ALL ---
+        if (tok == CasioTokenizer.TOK_NEW) {
+            advance(); // consume NEW
+            if (peekType() == CasioTokenizer.TOK_ALL) {
+                advance();
+                memoryManager.clearAll();
+            } else {
+                memoryManager.clearActiveSlot();
+            }
+            lastStatus = memoryManager.getPrompt();
+            return;
+        }
+
+        // --- CLEAR ---
+        if (tok == CasioTokenizer.TOK_CLEAR) {
+            advance();
+            Arrays.fill(variables, 0.0);
+            Arrays.fill(stringVars, null);
+            lastStatus = memoryManager.getPrompt();
+            return;
+        }
+
+        // --- PRINT ---
+        if (tok == CasioTokenizer.TOK_PRINT) {
+            advance(); // consume PRINT
+            if (peekType() == CasioTokenizer.TOK_STRING) {
+                String str = advance().text;
+                outputBuffer.append(str).append("\n");
+            } else {
+                double val = parseExpression();
+                outputBuffer.append(formatNumber(val)).append("\n");
+            }
+            lastStatus = memoryManager.getPrompt();
+            return;
+        }
+
+        // --- Variable assignment / Arrow storage / Expression ---
+        // Example: 10 → A, or A = 10, or calculation: 5 + 3
+        double exprVal = parseExpression();
+
+        if (peekType() == CasioTokenizer.TOK_ARROW) {
+            advance(); // consume →
+            if (peekType() == CasioTokenizer.TOK_IDENT) {
+                String varName = advance().text;
+                char v = varName.toUpperCase().charAt(0);
+                setVariable(v, exprVal);
+            }
+        } else if (peekType() == CasioTokenizer.TOK_EQUAL) {
+            // Already parsed left as identifier if was variable
+            // For standard assignment handled in expression
+        } else {
+            // Direct expression evaluation (e.g. calculator display)
+            outputBuffer.append(formatNumber(exprVal)).append("\n");
+        }
+        lastStatus = memoryManager.getPrompt();
     }
 
-    /** Error reporting */
-    private String error(String message) {
-        throw new RuntimeException(
-            "CASIO BASIC Error at line " + currentLineNum +
-            ", position " + line + ":" + column + " - " + message
-        );
-    }
+    // --- Expression Grammar (Double-precision) ---
 
-    // ---- Grammar Methods (precedence: lowest to highest) ----
-
-    /** expression := term (('+' | '-') term)* */
-    private int parseExpression() {
-        int left = parseTerm();
+    private double parseExpression() {
+        double left = parseTerm();
 
         while (true) {
-            int tok = peek();
+            int tok = peekType();
             if (tok == CasioTokenizer.TOK_PLUS) {
                 advance();
-                int right = parseTerm();
-                return applyBinaryOp(tok, right); // PLUS
+                double right = parseTerm();
+                left = left + right;
             } else if (tok == CasioTokenizer.TOK_MINUS) {
                 advance();
-                int right = parseTerm();
-                return applyBinaryOp(tok, right); // MINUS
+                double right = parseTerm();
+                left = left - right;
             } else {
                 return left;
             }
         }
     }
 
-    /** term := factor (('*' | '/') factor)* */
-    private int parseTerm() {
-        int left = parseFactor();
+    private double parseTerm() {
+        double left = parsePower();
 
         while (true) {
-            int tok = peek();
+            int tok = peekType();
             if (tok == CasioTokenizer.TOK_STAR) {
                 advance();
-                int right = parseFactor();
-                return applyBinaryOp(tok, right); // TIMES
+                double right = parsePower();
+                left = left * right;
             } else if (tok == CasioTokenizer.TOK_SLASH) {
                 advance();
-                int right = parseFactor();
-                return applyBinaryOp(tok, right); // DIVIDE (with zero-check)
+                double right = parsePower();
+                if (right == 0.0) {
+                    throw new RuntimeException("Division by zero");
+                }
+                left = left / right;
             } else {
                 return left;
             }
         }
     }
 
-    /** factor := power */
-    private int parseFactor() {
-        return parsePower();
-    }
-
-    /** power := unary ('^' power)?  right-associative */
-    private int parsePower() {
-        int base = parseUnary();
-
-        if (peek() == CasioTokenizer.TOK_POWER) {
-            advance(); // consume '^'
-            // Right-associative: recursively parse the exponent
-            int exponent = parsePower(); // parse exponent first (right-assoc)
-            return applyPowerOp(base, exponent);
+    private double parsePower() {
+        double base = parseUnary();
+        if (peekType() == CasioTokenizer.TOK_POWER) {
+            advance();
+            double exp = parsePower(); // right-associative
+            return Math.pow(base, exp);
         }
-
         return base;
     }
 
-    /** unary := '-' unary | '+' unary | primary */
-    private int parseUnary() {
-        int tok = peek();
-
+    private double parseUnary() {
+        int tok = peekType();
         if (tok == CasioTokenizer.TOK_MINUS) {
             advance();
-            int right = parseUnary();
-            return applyUnaryOp(tok, right); // unary negation
+            return -parseUnary();
         } else if (tok == CasioTokenizer.TOK_PLUS) {
             advance();
-            return parseUnary(); // unary plus - just continue
+            return parseUnary();
         }
-
         return parsePrimary();
     }
 
-    /** primary := NUMBER | IDENTIFIER | '(' expression ')' | storage */
-    private int parsePrimary() {
-        int tok = peek();
+    private double parsePrimary() {
+        int tok = peekType();
 
+        // Number literal
         if (tok == CasioTokenizer.TOK_NUMBER) {
+            CasioTokenizer.Token t = advance();
+            try {
+                return Double.parseDouble(t.text);
+            } catch (NumberFormatException e) {
+                return 0.0;
+            }
+        }
+
+        // Functions: SQR, SIN, COS, TAN, ABS, LOG, LN, EXP, RND
+        if (isMathFunction(tok)) {
             advance();
-            return tokenNumberValue(tok); // the encoded value
-        } else if (tok == CasioTokenizer.TOK_IDENT) {
-            // Check if this is a variable assignment or storage
+            double arg = parsePrimary();
+            return applyMathFunction(tok, arg);
+        }
+
+        // Parentheses ( expr )
+        if (tok == CasioTokenizer.TOK_LPAREN) {
             advance();
-            // Look ahead: is next token = or → ?
-            // In real CASIO, after a variable we need to determine
-            // A = 10  vs  A → 10
-            // For simplicity in MVP: check next token
-            if (peek() == CasioTokenizer.TOK_EQUAL) {
-                advance(); // consume =
-                // Assignment: A = expression
-                int value = parseExpression();
-                String varName = getIdentName(); // need to track identifier name
-                // Store into numeric variable table
-                // Simple: just return the value, parser caller handles assignment
-                return value;
-            } else if (peek() == CasioTokenizer.TOK_ARROW) {
-                advance(); // consume →
-                // Storage: A → B stores into B
-                int target = getIdentIndex(); // get variable index for B
-                int value = parseExpression();
-                // Store value into variable `target` (which is B)
-                variables[target] = value;
-                return value;
-            } else {
-                // Just a variable reference - return its value
-                int idx = getIdentIndex();
-                return variables[idx];
-            }
-        } else if (tok == CasioTokenizer.TOK_LPAREN) {
-            advance(); // consume '('
-            int result = parseExpression();
-            if (peek() != CasioTokenizer.TOK_RPAREN) {
-                error("Expected ')'");
-            }
-            advance(); // consume ')'
-            return result;
-        } else {
-            error("Expected primary expression, got " + CasioTokenizer.tokenToString(tok));
-            return 0;
-        }
-    }
-
-    /** Get identifier name from the source (simplified - needs source tracking) */
-    private String getIdentName() {
-        // In a full implementation, we'd track the identifier name
-        // For now, return a generic label
-        return "X";
-    }
-
-    /** Get variable index (0-25 for A-Z, 26 for M) */
-    private int getIdentIndex() {
-        // Simplified: assume single char variable
-        // Real implementation would parse the identifier token
-        return 0; // placeholder
-    }
-
-    /** Apply binary operation */
-    private int applyBinaryOp(int op, int right) {
-        int left = peek(); // this is wrong - need left value
-        // This method signature is problematic. Let me restructure.
-        return 0;
-    }
-
-    /** Apply unary operation */
-    private int applyUnaryOp(int op, int right) {
-        // -5, +3, etc.
-        if (op == CasioTokenizer.TOK_MINUS) {
-            return -right;
-        }
-        return right; // TOK_PLUS
-    }
-
-    /** Apply power operation (right-associative) */
-    private int applyPowerOp(int base, int exponent) {
-        // double power = Math.pow(base, exponent); // but we're using ints...
-        // For MVP, just multiply or use integer power
-        // Actually, let's use double for power functions
-        // But our numbers are ints... let me reconsider the architecture
-        return (int) Math.pow(base, exponent);
-    }
-
-    /** Handle number token - extract the value */
-    private double tokenNumberValue(int tok) {
-        // The number encoding: we stored int/float in the lower bytes
-        // For simplicity, return as double
-        // In real implementation, the tokenizer encodes the value properly
-        return 0; // placeholder
-    }
-
-    // ---- Statement Parsing ----
-
-    /** Parse a full CASIO BASIC statement */
-    /** program := statement*
-     * statement := assignment | input_output | loop | goto | gosub | if | clear
-     * assignment := variable = expression | variable → expression
-     * input_output := PRINT expression | INPUT variable
-     * loop := FOR var = expression TO expression [STEP expression]
-     * goto := GOTO line_number
-     * gosub := GOSUB line_number
-     * if := IF condition THEN line_number [ELSE line_number]
-     * clear := CLEAR [ALL] | CLEAR PROG
-     */
-
-    /** Parse full program/statement */
-    public int[] parseStatement() {
-        // Parse one statement, return [tokenType, result] or similar
-        // For MVP, let's parse expression-level and handle statements in caller
-        // This is getting complex - let me simplify for the MVP approach
-        return new int[]{peek(), parseExpression()};
-    }
-
-    /** Execute one statement (called repeatedly for RUN) */
-    public int executeStatement() {
-        if (!running) return 0;
-
-        int tok = peek();
-
-        // Handle line number directive? For CASIO, statements start with line numbers
-        // 10 PRINT "HELLO"
-        // 20 INPUT A
-        // etc.
-
-        // For MVP, let's handle the core cases:
-
-        if (tok == CasioTokenizer.TOK_PRINT) {
-            advance(); // consume PRINT
-            int expr = parseExpression();
-            // In real CASIO: print to the 2-line display
-            // System.out.println("PRINT: " + expr); // debug
-            return expr;
-        }
-
-        if (tok == CasioTokenizer.TOK_INPUT) {
-            advance(); // consume INPUT
-            // INPUT "prompt", variable
-            // For MVP: INPUT without prompt, into first available string var
-            int varIndex = findAvailableStringVar();
-            if (varIndex >= 0) {
-                // Read input from system - simplified: just use placeholder
-                stringVars[varIndex] = "INPUT_VALUE"; // placeholder
-                return varIndex;
-            }
-            return -1;
-        }
-
-        if (tok == CasioTokenizer.TOK_FOR) {
-            advance(); // FOR
-            // FOR I = start TO end [STEP step]
-            // Simplified: just parse and set up loop
-            // Real implementation would need variable tracking
-            advance(); // consume FOR
-            // Parse variable name
-            int varIdx = getIdentIndex();
-            if (peek() != CasioTokenizer.TOK_EQUAL) error("Expected = after FOR variable");
-            advance(); // consume =
-            int start = parseExpression();
-            if (peek() != CasioTokenizer.TOK_TO) error("Expected TO in FOR");
-            advance(); // consume TO
-            int endVal = parseExpression();
-            int step = 1; // default step
-            if (peek() == CasioTokenizer.TOK_STEP) {
+            double val = parseExpression();
+            if (peekType() == CasioTokenizer.TOK_RPAREN) {
                 advance();
-                step = parseExpression();
             }
-            // In real implementation: set up loop from start to end with step
-            // For MVP: just evaluate and return
-            advance(); // consume NEXT (simplified)
-            return 0;
+            return val;
         }
 
-        if (tok == CasioTokenizer.TOK_GOTO) {
-            advance(); // GOTO
-            int lineNum = parseExpression(); // line number to jump to
-            // Implement GOTO by setting currentLine to target
-            // for(next statement will execute from that line)
-            currentLine = lineNum;
-            return lineNum;
-        }
+        // Identifier (Variable)
+        if (tok == CasioTokenizer.TOK_IDENT) {
+            CasioTokenizer.Token t = advance();
+            char varChar = t.text.toUpperCase().charAt(0);
 
-        if (tok == CasioTokenizer.TOK_GOSUB) {
-            advance(); // GOSUB
-            int lineNum = parseExpression();
-            // Push return address and jump to line
-            // For MVP: simple jump, no real stack
-            currentLine = lineNum;
-            return lineNum;
-        }
-
-        if (tok == CasioTokenizer.TOK_RETURN) {
-            advance(); // RETURN
-            // Pop return address and resume
-            // For MVP: just stop or resume from where we were
-            running = false; // simplified
-            return 0;
-        }
-
-        if (tok == CasioTokenizer.TOK_IF) {
-            advance(); // IF
-            int condition = parseExpression();
-            if (peek() != CasioTokenizer.TOK_THEN) error("Expected THEN after IF condition");
-            advance(); // consume THEN
-            int targetLine = parseExpression();
-
-            // Evaluate condition and jump if true
-            boolean condResult = evaluateCondition(condition);
-            if (condResult) {
-                currentLine = targetLine;
+            // Check if followed by = (e.g. A = 5)
+            if (peekType() == CasioTokenizer.TOK_EQUAL) {
+                advance(); // consume =
+                double val = parseExpression();
+                setVariable(varChar, val);
+                return val;
             }
-            // If false: just continue to next statement (line number driven)
-            return 0;
+
+            return getVariable(varChar);
         }
 
-        // CLEAR statement
-        if (tok == CasioTokenizer.TOK_CLEAR) {
-            advance(); // CLEAR
-            // Clear program memory or all
-            // For MVP:
-            java.util.Arrays.fill(variables, 0);
-            java.util.Arrays.fill(stringVars, null);
-            return 0;
-        }
-
-        // Default: just evaluate an expression (expression statement)
-        int result = parseExpression();
-        return result;
+        return 0.0;
     }
 
-    /** Evaluate a condition (simplified) */
-    private boolean evaluateCondition(int condition) {
-        // Parse the condition expression and compare
-        // For MVP: just compare against 0
-        return condition != 0;
+    private boolean isMathFunction(int tok) {
+        return tok == CasioTokenizer.TOK_SQR || tok == CasioTokenizer.TOK_SIN ||
+               tok == CasioTokenizer.TOK_COS || tok == CasioTokenizer.TOK_TAN ||
+               tok == CasioTokenizer.TOK_ABS || tok == CasioTokenizer.TOK_LOG ||
+               tok == CasioTokenizer.TOK_LN  || tok == CasioTokenizer.TOK_EXP ||
+               tok == CasioTokenizer.TOK_RND || tok == CasioTokenizer.TOK_SGN;
     }
 
-    /** Find available string variable index */
-    private int findAvailableStringVar() {
-        for (int i = 0; i < stringVars.length; i++) {
-            if (stringVars[i] == null) {
-                return i;
-            }
-        }
-        // Overwrite first (simplified)
-        return 0;
-    }
-
-    // ---- Utility Methods ----
-
-    /** Reset runtime state for new program execution */
-    public void resetState() {
-        java.util.Arrays.fill(variables, 0);
-        java.util.Arrays.fill(stringVars, null);
-        java.util.Arrays.fill(lineNumbers, -1);
-        currentLine = 0;
-        currentLineNum = 0;
-        running = true;
-    }
-
-    /** Get current variable value */
-    public double getVariable(int index) {
-        if (index >= 0 && index < variables.length) {
-            return variables[index];
-        }
-        return 0;
-    }
-
-    /** Set variable value */
-    public void setVariable(int index, double value) {
-        if (index >= 0 && index < variables.length) {
-            variables[index] = value;
+    private double applyMathFunction(int tok, double arg) {
+        switch (tok) {
+            case CasioTokenizer.TOK_SQR: return Math.sqrt(arg);
+            case CasioTokenizer.TOK_SIN: return Math.sin(Math.toRadians(arg)); // Degree mode default
+            case CasioTokenizer.TOK_COS: return Math.cos(Math.toRadians(arg));
+            case CasioTokenizer.TOK_TAN: return Math.tan(Math.toRadians(arg));
+            case CasioTokenizer.TOK_ABS: return Math.abs(arg);
+            case CasioTokenizer.TOK_LOG: return Math.log10(arg);
+            case CasioTokenizer.TOK_LN:  return Math.log(arg);
+            case CasioTokenizer.TOK_EXP: return Math.exp(arg);
+            case CasioTokenizer.TOK_RND: return Math.random();
+            case CasioTokenizer.TOK_SGN: return Math.signum(arg);
+            default: return arg;
         }
     }
 
-    /** Get string variable value */
-    public String getStringVariable(int index) {
-        if (index >= 0 && index < stringVars.length) {
-            return stringVars[index];
+    private CasioTokenizer.Token advance() {
+        if (pos < tokens.size()) {
+            return tokens.get(pos++);
         }
-        return null;
+        return new CasioTokenizer.Token(CasioTokenizer.TOK_EOF, "", 0, 0);
     }
 
-    /** Set string variable value */
-    public void setStringVariable(int index, String value) {
-        if (index >= 0 && index < stringVars.length) {
-            stringVars[index] = value;
+    private int peekType() {
+        if (tokens != null && pos < tokens.size()) {
+            return tokens.get(pos).type;
         }
+        return CasioTokenizer.TOK_EOF;
     }
 
-    /** Display current variable state (for debug) */
-    public String dumpState() {
-        StringBuilder sb = new StringBuilder();
-        sb.append("Variables (A-Z, M):\n");
-        char varName = 'A';
-        for (int i = 0; i < variables.length; i++) {
-            sb.append(varName).append("=").append(String.format("%.2f", variables[i])).append("\n");
-            varName++;
-            if (varName > 'Z') {
-                varName = 'M' - 'A' + 'A'; // wrap after Z to M handling
-                // Actually let me just track A-Z only for simplicity
-                break;
-            }
+    private String formatNumber(double val) {
+        if (val == (long) val) {
+            return String.format("%d", (long) val);
         }
-        sb.append("\nString vars (A-Z$):\n");
-        for (int i = 0; i < stringVars.length; i++) {
-            sb.append((char)('A' + i)).append("$=").append(stringVars[i]).append("\n");
-        }
-        sb.append("Current line: ").append(currentLine).append("\n");
-        return sb.toString();
+        return String.valueOf(val);
     }
 }
