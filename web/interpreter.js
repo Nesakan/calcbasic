@@ -51,7 +51,7 @@ class CasioInterpreter {
         // 3. CLEAR
         if (/^CLEAR$/i.test(line)) {
             this.clearVariables();
-            return { type: 'ready', text: '', sub: this.memory.getPrompt() };
+            return { type: 'ready', text: 'CLEARED', sub: this.memory.getPrompt() };
         }
 
         // 4. SAVE / SAVE ALL
@@ -164,13 +164,17 @@ class CasioInterpreter {
             const varName = parts[1].trim().toUpperCase().charAt(0);
             if (varName >= 'A' && varName <= 'Z') {
                 this.variables[varName] = val;
-                return { type: 'ready', text: String(val), sub: this.memory.getPrompt() };
+                return { type: 'output', text: String(val), sub: this.memory.getPrompt() };
             }
         }
 
         // 10. PRINT statement
-        if (/^PRINT\s+/i.test(line)) {
-            const exprStr = line.slice(5).trim();
+        if (/^PRINT(?:\s+(.*))?$/i.test(line)) {
+            const m = line.match(/^PRINT(?:\s+(.*))?$/i);
+            const exprStr = m && m[1] ? m[1].trim() : "";
+            if (!exprStr) {
+                return { type: 'output', text: '', sub: this.memory.getPrompt() };
+            }
             const evaluated = this.evaluateExpression(exprStr);
             return { type: 'output', text: String(evaluated), sub: this.memory.getPrompt() };
         }
@@ -181,10 +185,10 @@ class CasioInterpreter {
             const varName = assignMatch[1].toUpperCase();
             const val = this.evaluateExpression(assignMatch[2].trim());
             this.variables[varName] = val;
-            return { type: 'ready', text: String(val), sub: this.memory.getPrompt() };
+            return { type: 'output', text: String(val), sub: this.memory.getPrompt() };
         }
 
-        // 12. Direct Expression evaluation (e.g. 5 + 3 * 2, SIN 45)
+        // 12. Direct Expression evaluation or quoted text (e.g. 5 + 3 * 2, "HELLO", SIN 45)
         try {
             const val = this.evaluateExpression(line);
             return { type: 'output', text: String(val), sub: this.memory.getPrompt() };
@@ -194,7 +198,7 @@ class CasioInterpreter {
     }
 
     /**
-     * Executes the stored BASIC program in active slot.
+     * Executes the stored BASIC program in active slot with full FOR/NEXT loops.
      */
     runProgram() {
         const program = this.memory.getActiveProgram();
@@ -210,9 +214,9 @@ class CasioInterpreter {
         for (let l of lines) {
             const m = l.match(/^([0-9]+)\s*(.*)$/);
             if (m) {
-                parsed.push({ num: parseInt(m[1], 10), stmt: m[2] });
+                parsed.push({ num: parseInt(m[1], 10), stmt: m[2].trim() });
             } else {
-                parsed.push({ num: 0, stmt: l });
+                parsed.push({ num: 0, stmt: l.trim() });
             }
         }
 
@@ -220,20 +224,65 @@ class CasioInterpreter {
 
         let pc = 0;
         let iterations = 0;
-        const MAX_STEPS = 1000;
+        const MAX_STEPS = 2000;
+        const loopStack = []; // { varName, endVal, step, loopPc }
 
         while (pc < parsed.length && iterations < MAX_STEPS) {
             iterations++;
             const { num, stmt } = parsed[pc];
             if (!stmt) { pc++; continue; }
 
-            // PRINT
-            if (/^PRINT\s+/i.test(stmt)) {
-                const expr = stmt.slice(5).trim();
-                if (expr.startsWith('"') && expr.endsWith('"')) {
+            // PRINT statement
+            const printMatch = stmt.match(/^PRINT(?:\s+(.*))?$/i);
+            if (printMatch) {
+                const expr = printMatch[1] ? printMatch[1].trim() : "";
+                if (!expr) {
+                    output.push("");
+                } else if (expr.startsWith('"') && expr.endsWith('"') && expr.length >= 2) {
                     output.push(expr.slice(1, -1));
                 } else {
                     output.push(String(this.evaluateExpression(expr)));
+                }
+                pc++;
+                continue;
+            }
+
+            // FOR loop: FOR I = 1 TO 5 [STEP 1]
+            const forMatch = stmt.match(/^FOR\s+([A-Za-z])\s*=\s*(.+?)\s+TO\s+(.+?)(?:\s+STEP\s+(.+))?$/i);
+            if (forMatch) {
+                const varName = forMatch[1].toUpperCase();
+                const startVal = Number(this.evaluateExpression(forMatch[2].trim()));
+                const endVal = Number(this.evaluateExpression(forMatch[3].trim()));
+                const stepVal = forMatch[4] ? Number(this.evaluateExpression(forMatch[4].trim())) : 1;
+
+                this.variables[varName] = startVal;
+                loopStack.push({
+                    varName,
+                    endVal,
+                    step: stepVal,
+                    loopPc: pc + 1
+                });
+                pc++;
+                continue;
+            }
+
+            // NEXT statement
+            const nextMatch = stmt.match(/^NEXT(?:\s+([A-Za-z]))?$/i);
+            if (nextMatch) {
+                if (loopStack.length > 0) {
+                    const top = loopStack[loopStack.length - 1];
+                    this.variables[top.varName] = Number(this.variables[top.varName]) + top.step;
+                    
+                    const keepGoing = top.step >= 0 
+                        ? this.variables[top.varName] <= top.endVal 
+                        : this.variables[top.varName] >= top.endVal;
+
+                    if (keepGoing) {
+                        pc = top.loopPc;
+                        continue;
+                    } else {
+                        loopStack.pop();
+                    }
                 }
                 pc++;
                 continue;
@@ -252,7 +301,7 @@ class CasioInterpreter {
                 }
             }
 
-            // Arrow storage or assignment
+            // Arrow storage (expr → var)
             if (stmt.includes("→") || stmt.includes("->")) {
                 const parts = stmt.split(/→|->/);
                 const val = this.evaluateExpression(parts[0].trim());
@@ -264,6 +313,7 @@ class CasioInterpreter {
                 continue;
             }
 
+            // Standard assignment (A = expr)
             const assignMatch = stmt.match(/^([A-Za-z])\s*=\s*(.+)$/);
             if (assignMatch) {
                 const varName = assignMatch[1].toUpperCase();
@@ -273,14 +323,20 @@ class CasioInterpreter {
                 continue;
             }
 
-            // Default
+            // Unrecognized or remark
             pc++;
         }
 
-        const lastOut = output.length > 0 ? output[output.length - 1] : "DONE";
+        // Format LCD display output
+        let displayText = "DONE";
+        if (output.length > 0) {
+            // If output has multiple items, join neatly for LCD
+            displayText = output.join(" ");
+        }
+
         return {
             type: 'output',
-            text: lastOut,
+            text: displayText,
             sub: this.memory.getPrompt(),
             fullOutput: output
         };
@@ -293,13 +349,21 @@ class CasioInterpreter {
         if (!expr) return 0;
         let clean = expr.trim();
 
-        // String literal
-        if (clean.startsWith('"') && clean.endsWith('"')) {
+        // String literal in double or single quotes
+        if ((clean.startsWith('"') && clean.endsWith('"') && clean.length >= 2) ||
+            (clean.startsWith("'") && clean.endsWith("'") && clean.length >= 2)) {
             return clean.slice(1, -1);
         }
 
-        // Replace Casio functions with Math equivalents
-        // In Casio calculators, trigonometric functions use Degree mode by default
+        // If it's a raw unquoted string like HELLO or CASIO without operators/numbers
+        if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(clean) && clean.length > 1) {
+            // Check if it's a known constant like PI
+            if (clean.toUpperCase() === "PI") return Math.PI;
+            // Otherwise, treat as string constant
+            return clean;
+        }
+
+        // Replace Casio functions with Math equivalents (Degree mode by default)
         clean = clean.replace(/\bSIN\s*\(([^)]+)\)/gi, 'Math.sin(($1) * Math.PI / 180)')
                      .replace(/\bSIN\s+([0-9.]+|[A-Za-z])/gi, 'Math.sin(($1) * Math.PI / 180)')
                      .replace(/\bCOS\s*\(([^)]+)\)/gi, 'Math.cos(($1) * Math.PI / 180)')
@@ -319,7 +383,7 @@ class CasioInterpreter {
         // Power operator ^ -> **
         clean = clean.replace(/\^/g, '**');
 
-        // Replace variable identifiers A-Z with their numeric values
+        // Replace single-letter variable identifiers A-Z with their numeric values
         clean = clean.replace(/\b([A-Z])\b/g, (match, varChar) => {
             if (this.variables.hasOwnProperty(varChar)) {
                 return this.variables[varChar];
@@ -328,14 +392,14 @@ class CasioInterpreter {
         });
 
         try {
-            // Safe evaluation using Function
             const res = Function(`"use strict"; return (${clean});`)();
             if (typeof res === "number") {
                 return Number.isInteger(res) ? res : parseFloat(res.toFixed(6));
             }
             return res;
         } catch (e) {
-            throw new Error("Syntax Error");
+            // If syntax error but looks like text, return as string
+            return expr;
         }
     }
 }

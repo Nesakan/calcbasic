@@ -44,8 +44,9 @@ document.addEventListener("DOMContentLoaded", () => {
     const btnEraseTape = document.getElementById("btnEraseTape");
     const btnSoundToggle = document.getElementById("btnSoundToggle");
 
-    // Command line buffer
+    // State
     let currentInput = "";
+    let displayedOutput = "";
     let counterVal = 0;
     let isExecuting = false;
 
@@ -55,7 +56,13 @@ document.addEventListener("DOMContentLoaded", () => {
     };
 
     function updateLcdDisplay() {
-        lcdText.textContent = currentInput;
+        if (currentInput) {
+            lcdText.textContent = currentInput;
+        } else if (displayedOutput) {
+            lcdText.textContent = displayedOutput;
+        } else {
+            lcdText.textContent = "";
+        }
         lcdSlotBadge.textContent = `SLOT [P${memory.getActiveSlot()}]`;
         updateSlotButtons();
     }
@@ -119,32 +126,44 @@ document.addEventListener("DOMContentLoaded", () => {
             const res = await interpreter.executeDirect(cmd);
             
             if (res.delayMs) {
-                // Show intermediate state (e.g. search indicator "BASIC   B")
                 if (res.text) {
                     lcdText.textContent = res.text;
                 }
                 await new Promise(r => setTimeout(r, res.delayMs));
             }
 
+            displayedOutput = res.text != null ? String(res.text) : "";
+            currentInput = "";
+
             if (res.type === 'error') {
                 audio.playErrorBeep();
-                lcdText.textContent = res.text;
+                lcdText.textContent = displayedOutput;
                 lcdStatus.textContent = res.sub || memory.getPrompt();
             } else {
                 audio.playBeep(880, 0.05);
-                lcdText.textContent = res.text;
+                lcdText.textContent = displayedOutput;
                 lcdStatus.textContent = res.sub || memory.getPrompt();
             }
         } catch (e) {
             audio.playErrorBeep();
-            lcdText.textContent = `P${memory.getActiveSlot()} error 0`;
+            displayedOutput = `P${memory.getActiveSlot()} error 0`;
+            currentInput = "";
+            lcdText.textContent = displayedOutput;
             lcdStatus.textContent = memory.getPrompt();
         } finally {
-            currentInput = "";
             isExecuting = false;
             lcdCursor.style.display = "inline-block";
-            updateLcdDisplay();
+            updateSlotButtons();
         }
+    }
+
+    function appendKeyInput(key) {
+        if (displayedOutput) {
+            // New input replaces previously displayed output
+            displayedOutput = "";
+        }
+        currentInput += key;
+        updateLcdDisplay();
     }
 
     // Keypad Click Event Handling
@@ -165,38 +184,39 @@ document.addEventListener("DOMContentLoaded", () => {
 
         if (key === "AC") {
             currentInput = "";
+            displayedOutput = "";
             lcdText.textContent = "";
             lcdStatus.textContent = memory.getPrompt();
             return;
         }
 
         if (key === "DEL") {
-            currentInput = currentInput.slice(0, -1);
+            if (currentInput.length > 0) {
+                currentInput = currentInput.slice(0, -1);
+            } else {
+                displayedOutput = "";
+            }
             updateLcdDisplay();
             return;
         }
 
         if (key === "NEW") {
-            currentInput = "NEW";
-            updateLcdDisplay();
+            appendKeyInput("NEW");
             return;
         }
 
         if (key === "ALL") {
-            currentInput += (currentInput.length > 0 && !currentInput.endsWith(" ") ? " " : "") + "ALL";
-            updateLcdDisplay();
+            appendKeyInput((currentInput.length > 0 && !currentInput.endsWith(" ") ? " " : "") + "ALL");
             return;
         }
 
         // Functions with auto-space
         if (["SIN", "COS", "TAN", "SQR"].includes(key)) {
-            currentInput += key + " ";
-            updateLcdDisplay();
+            appendKeyInput(key + " ");
             return;
         }
 
-        currentInput += key;
-        updateLcdDisplay();
+        appendKeyInput(key);
     });
 
     // Program Slot (P0 - P9) Tab Switching
@@ -206,6 +226,9 @@ document.addEventListener("DOMContentLoaded", () => {
         audio.playClick();
         const slot = parseInt(btn.dataset.slot, 10);
         memory.setActiveSlot(slot);
+        currentInput = "";
+        displayedOutput = "";
+        lcdText.textContent = "";
         lcdStatus.textContent = memory.getPrompt();
         updateLcdDisplay();
     });
@@ -213,24 +236,28 @@ document.addEventListener("DOMContentLoaded", () => {
     // Quick Action Tape Buttons
     document.getElementById("btnQuickSave").addEventListener("click", () => {
         audio.playClick();
+        displayedOutput = "";
         currentInput = `SAVE "BASIC"`;
         updateLcdDisplay();
     });
 
     document.getElementById("btnQuickLoad").addEventListener("click", () => {
         audio.playClick();
+        displayedOutput = "";
         currentInput = `LOAD "BASIC"`;
         updateLcdDisplay();
     });
 
     document.getElementById("btnQuickVerify").addEventListener("click", () => {
         audio.playClick();
+        displayedOutput = "";
         currentInput = `VERIFY "BASIC"`;
         updateLcdDisplay();
     });
 
     document.getElementById("btnQuickRun").addEventListener("click", () => {
         audio.playClick();
+        displayedOutput = "";
         currentInput = "RUN";
         handleExecute();
     });
@@ -238,7 +265,7 @@ document.addEventListener("DOMContentLoaded", () => {
     // Physical Keyboard Listener
     window.addEventListener("keydown", (e) => {
         if (modalEditor.classList.contains("open") || modalTapeLibrary.classList.contains("open")) {
-            return; // Allow normal typing in editor
+            return; // Allow normal typing in editor/modals
         }
 
         if (e.key === "Enter") {
@@ -249,7 +276,11 @@ document.addEventListener("DOMContentLoaded", () => {
 
         if (e.key === "Backspace") {
             e.preventDefault();
-            currentInput = currentInput.slice(0, -1);
+            if (currentInput.length > 0) {
+                currentInput = currentInput.slice(0, -1);
+            } else {
+                displayedOutput = "";
+            }
             updateLcdDisplay();
             return;
         }
@@ -257,6 +288,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (e.key === "Escape") {
             e.preventDefault();
             currentInput = "";
+            displayedOutput = "";
             lcdText.textContent = "";
             lcdStatus.textContent = memory.getPrompt();
             return;
@@ -265,8 +297,7 @@ document.addEventListener("DOMContentLoaded", () => {
         // Printable characters
         if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
             audio.playClick();
-            currentInput += e.key;
-            updateLcdDisplay();
+            appendKeyInput(e.key);
         }
     });
 
@@ -293,9 +324,12 @@ document.addEventListener("DOMContentLoaded", () => {
         audio.playClick();
         memory.setActiveProgram(txtProgramEditor.value);
         modalEditor.classList.remove("open");
-        updateLcdDisplay();
+        currentInput = "";
+        displayedOutput = "";
+        lcdText.textContent = "";
         lcdStatus.textContent = `${memory.getPrompt()} (SAVED)`;
         setTimeout(() => { lcdStatus.textContent = memory.getPrompt(); }, 1500);
+        updateLcdDisplay();
     });
 
     btnClearSlotCode.addEventListener("click", () => {
@@ -366,12 +400,12 @@ document.addEventListener("DOMContentLoaded", () => {
             tapeRecordsList.appendChild(card);
         });
 
-        // Attach buttons in library
         tapeRecordsList.querySelectorAll(".btn-load-tape").forEach(b => {
             b.addEventListener("click", () => {
                 const name = b.dataset.name;
                 const isAll = b.dataset.all === "true";
                 modalTapeLibrary.classList.remove("open");
+                displayedOutput = "";
                 currentInput = isAll ? (name ? `LOAD ALL "${name}"` : `LOAD ALL`) : (name ? `LOAD "${name}"` : `LOAD`);
                 handleExecute();
             });
@@ -381,6 +415,7 @@ document.addEventListener("DOMContentLoaded", () => {
             b.addEventListener("click", () => {
                 const name = b.dataset.name;
                 modalTapeLibrary.classList.remove("open");
+                displayedOutput = "";
                 currentInput = name ? `VERIFY "${name}"` : `VERIFY`;
                 handleExecute();
             });
